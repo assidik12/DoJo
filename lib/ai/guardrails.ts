@@ -108,6 +108,13 @@ export interface QueryIntentAnalysis {
   cleanModuleCoreQuery: string;
 }
 
+const ALLOWED_CONVERSATIONAL_PROMPTS = [
+  "gue siap belajar materi ini", "siap belajar", "mulai belajar", "siap nugas", "gue siap",
+  "nama kamu", "siapa kamu", "kamu siapa", "nama lo", "siapa lo", "lo siapa",
+  "halo neko", "hi neko", "hai neko", "siapa neko", "neko itu siapa",
+  "siapa namamu", "siapa namamu?", "siapa nama mu"
+];
+
 /**
  * Dynamic Intent Classifier (Menangani input acak real user secara dinamis berbasis modul yang aktif)
  */
@@ -115,8 +122,8 @@ export async function classifyQueryIntent(
   query: string,
   moduleInfo?: ModuleContext
 ): Promise<QueryIntentAnalysis> {
-  const readyPrompts = ["gue siap belajar materi ini", "siap belajar", "mulai belajar"];
-  if (readyPrompts.some(p => query.toLowerCase().includes(p))) {
+  const normalizedQuery = query.toLowerCase();
+  if (ALLOWED_CONVERSATIONAL_PROMPTS.some(p => normalizedQuery.includes(p))) {
     return {
       isPureEthicsTopic: true,
       isPureModuleTopic: true,
@@ -125,6 +132,7 @@ export async function classifyQueryIntent(
       cleanModuleCoreQuery: query,
     };
   }
+
 
   const moduleScope = moduleInfo
     ? `materi/modul "${moduleInfo.courseName} - ${moduleInfo.moduleTitle}"${moduleInfo.moduleSummary ? ` (Ringkasan: ${moduleInfo.moduleSummary})` : ""}`
@@ -199,11 +207,12 @@ export async function validateQueryWithGuardrails(
     return { allowed: true, contextStr: "" };
   }
 
-  // Allow affirmative prompts about being ready to study
-  const readyPrompts = ["gue siap belajar materi ini", "siap belajar", "mulai belajar"];
-  if (readyPrompts.some(p => userQuery.toLowerCase().includes(p))) {
+  // Allow affirmative prompts and identity/greeting questions
+  const normalized = userQuery.toLowerCase();
+  if (ALLOWED_CONVERSATIONAL_PROMPTS.some(p => normalized.includes(p))) {
     return { allowed: true, contextStr: "" };
   }
+
 
   try {
     const embedding = await getEmbedding(userQuery);
