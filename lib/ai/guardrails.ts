@@ -15,6 +15,175 @@ export function getGenZFallbackMessage(): string {
   return FALLBACK_MESSAGES[randomIndex];
 }
 
+// 1. Blacklist Pattern untuk Direct Prompt Injection
+const INJECTION_PATTERNS = [
+  /ignore (all )?previous instructions/i,
+  /abaikan (semua )?instruksi/i,
+  /system prompt/i,
+  /kamu adalah (bot|ai) /i,
+  /you are now a/i,
+  /override/i,
+  /matikan persona/i,
+  /disable persona/i,
+  /mode debug/i,
+  /debug mode/i,
+  /developer mode/i,
+  /jailbreak/i,
+  /"?role"?\s*:\s*"?system"?/i,
+  /act as /i,
+];
+
+export function isPromptInjection(query: string): boolean {
+  return INJECTION_PATTERNS.some((pattern) => pattern.test(query));
+}
+
+export interface ModerationResult {
+  flagged: boolean;
+  categories?: Record<string, boolean>;
+  reason?: string;
+}
+
+/**
+ * OpenAI Content Moderation API with End-User ID Abuse Monitoring
+ * Endpoint: https://api.openai.com/v1/moderations
+ */
+export async function checkOpenAIModeration(query: string, userId?: string): Promise<ModerationResult> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    return { flagged: false };
+  }
+
+  try {
+    const res = await fetch("https://api.openai.com/v1/moderations", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        input: query,
+        user: userId || undefined, // Send end-user ID for OpenAI abuse monitoring
+      }),
+    });
+
+    if (!res.ok) {
+      console.warn("OpenAI Moderation API response not OK:", res.statusText);
+      return { flagged: false };
+    }
+
+    const data = await res.json();
+    const result = data.results?.[0];
+
+    if (result?.flagged) {
+      const flaggedCategories = Object.keys(result.categories || {}).filter(
+        (cat) => result.categories[cat]
+      );
+      return {
+        flagged: true,
+        categories: result.categories,
+        reason: `Flagged for: ${flaggedCategories.join(", ")}`,
+      };
+    }
+
+    return { flagged: false };
+  } catch (err: any) {
+    console.error("OpenAI Moderation Error:", err.message);
+    return { flagged: false };
+  }
+}
+
+
+export interface ModuleContext {
+  courseName: string;
+  moduleTitle: string;
+  moduleSummary?: string;
+}
+
+export interface QueryIntentAnalysis {
+  isPureEthicsTopic: boolean;
+  isPureModuleTopic: boolean;
+  hasOffTopicDistraction: boolean;
+  offTopicCategory?: string;
+  cleanEthicsCoreQuery: string;
+  cleanModuleCoreQuery: string;
+}
+
+/**
+ * Dynamic Intent Classifier (Menangani input acak real user secara dinamis berbasis modul yang aktif)
+ */
+export async function classifyQueryIntent(
+  query: string,
+  moduleInfo?: ModuleContext
+): Promise<QueryIntentAnalysis> {
+  const readyPrompts = ["gue siap belajar materi ini", "siap belajar", "mulai belajar"];
+  if (readyPrompts.some(p => query.toLowerCase().includes(p))) {
+    return {
+      isPureEthicsTopic: true,
+      isPureModuleTopic: true,
+      hasOffTopicDistraction: false,
+      cleanEthicsCoreQuery: query,
+      cleanModuleCoreQuery: query,
+    };
+  }
+
+  const moduleScope = moduleInfo
+    ? `materi/modul "${moduleInfo.courseName} - ${moduleInfo.moduleTitle}"${moduleInfo.moduleSummary ? ` (Ringkasan: ${moduleInfo.moduleSummary})` : ""}`
+    : `materi akademis/teknologi/coding`;
+
+  const classifierPrompt = `Tugasmu adalah menganalisis apakah pertanyaan pengguna berkaitan dengan ${moduleScope} atau memiliki elemen distraksi di luar topik tersebut (misal: kuliner, gaming, rakit PC, asmara, otomotif, politik, dll).
+
+Kembalikan respon DALAM FORMAT JSON murni (tanpa markdown backticks) dengan struktur berikut:
+{
+  "isPureModuleTopic": boolean (true jika pertanyaan 100% membahas materi dari ${moduleInfo ? moduleInfo.moduleTitle : "topik ini"}),
+  "hasOffTopicDistraction": boolean (true jika ada campuran elemen di luar topik modul/akademis),
+  "offTopicCategory": string atau null (sebutkan kategori topik luarnya jika ada, misal "Kuliner", "Gaming", "Curhat Pribadi", "Otomotif"),
+  "cleanModuleCoreQuery": string (ekstrak bagian pertanyaan yang murni membahas materi modul, atau string kosong jika tidak ada)
+}
+
+User Query: "${query.replace(/"/g, '\\"')}"`;
+
+  try {
+    const { getAiResponse } = await import("@/lib/ai/config");
+    const responseText = await getAiResponse(classifierPrompt, "Kamu adalah AI classifier yang hanya merespon dalam format JSON murni.", true);
+
+    if (responseText) {
+      const parsed = JSON.parse(responseText);
+      const cleanQuery = parsed.cleanModuleCoreQuery || parsed.cleanEthicsCoreQuery || query;
+      const isPure = Boolean(parsed.isPureModuleTopic ?? parsed.isPureEthicsTopic);
+      return {
+        isPureEthicsTopic: isPure,
+        isPureModuleTopic: isPure,
+        hasOffTopicDistraction: Boolean(parsed.hasOffTopicDistraction),
+        offTopicCategory: parsed.offTopicCategory || undefined,
+        cleanEthicsCoreQuery: cleanQuery,
+        cleanModuleCoreQuery: cleanQuery,
+      };
+    }
+  } catch (err) {
+    console.error("Error in classifyQueryIntent:", err);
+  }
+
+  // Fallback if classifier fails
+  return {
+    isPureEthicsTopic: true,
+    isPureModuleTopic: true,
+    hasOffTopicDistraction: false,
+    cleanEthicsCoreQuery: query,
+    cleanModuleCoreQuery: query,
+  };
+}
+
+
+// Backward compatibility helper
+export function sanitizeHybridQuery(query: string): { cleanQuery: string; hasOffTopic: boolean } {
+  return {
+    cleanQuery: query,
+    hasOffTopic: false,
+  };
+}
+
+
+
 /**
  * Validates user query against document vectors (RAG).
  * Implements P1 Vector Guardrails & Smart Query Detection.

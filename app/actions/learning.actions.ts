@@ -5,10 +5,41 @@ import { createClient } from "@/utils/supabase/server";
 import { cookies } from "next/headers";
 import { google } from "googleapis";
 import { getEmbedding, aiClient } from "@/lib/ai/config";
-import { generateDeterministicContent, generateFastResponse } from "@/lib/ai";
+import { generateDeterministicContent, generateFastResponse, SKS_MODE_SYSTEM_PROMPT, buildSKSModeSystemPrompt } from "@/lib/ai";
 import { parsePdfBuffer, chunkText } from "@/utils/pdfParser";
 import { createEvent } from "@/lib/google/calendar";
-import { validateQueryWithGuardrails } from "@/lib/ai/guardrails";
+import { validateQueryWithGuardrails, isPromptInjection, sanitizeHybridQuery, classifyQueryIntent, checkOpenAIModeration, ModuleContext } from "@/lib/ai/guardrails";
+
+import { Langfuse } from "langfuse";
+
+// Prompt Khusus Ringkasan Materi (Summary Sanitizer Dinamis)
+function buildSummaryGenerationPrompt(moduleTitle?: string): string {
+  return `
+Buatkan ringkasan poin-poin penting dari percakapan pembelajaran sebelumnya${moduleTitle ? ` untuk modul "${moduleTitle}"` : ""}.
+
+SYARAT FILTER RINGKASAN:
+1. HANYA rangkum konsep inti, teori, dan definisi dari materi pembelajaran yang dibahas${moduleTitle ? ` pada modul "${moduleTitle}"` : ""}.
+2. DILARANG KERAS memasukkan analogi sementara, candaan, contoh personal, atau percakapan santai (seperti contoh tentang crush, nasi padang, game, PS5, dll) ke dalam poin ringkasan.
+3. Tuliskan ringkasan dalam bentuk bullet points yang rapi dan akademis.
+`;
+}
+
+
+const getLangfuseClient = () => {
+  if (process.env.LANGFUSE_PUBLIC_KEY && process.env.LANGFUSE_SECRET_KEY) {
+    try {
+      return new Langfuse({
+        publicKey: process.env.LANGFUSE_PUBLIC_KEY,
+        secretKey: process.env.LANGFUSE_SECRET_KEY,
+        baseUrl: process.env.LANGFUSE_HOST || "https://cloud.langfuse.com",
+      });
+    } catch (e) {
+      console.warn("Langfuse init warning:", e);
+    }
+  }
+  return null;
+};
+
 
 export async function syncGoogleDriveFolder(driveUrl: string): Promise<ActionResponse<{ filesCount: number; folderName: string; dbFolderId: string }>> {
   try {
@@ -42,9 +73,9 @@ export async function syncGoogleDriveFolder(driveUrl: string): Promise<ActionRes
       files = res.data.files;
     } catch (apiErr: any) {
       console.error("Google Drive API Error:", apiErr.message);
-      return { 
-        success: false, 
-        error: "Gagal mengakses folder. Pastikan folder tersebut milikmu, atau akses sharing-nya sudah diubah menjadi 'Anyone with the link' (Publik)." 
+      return {
+        success: false,
+        error: "Gagal mengakses folder. Pastikan folder tersebut milikmu, atau akses sharing-nya sudah diubah menjadi 'Anyone with the link' (Publik)."
       };
     }
 
@@ -68,7 +99,7 @@ export async function syncGoogleDriveFolder(driveUrl: string): Promise<ActionRes
         })
         .select("id")
         .single();
-      
+
       if (folderError || !newFolder) return { success: false, error: "Failed to create folder record in DB." };
       dbFolder = newFolder;
     }
@@ -78,7 +109,7 @@ export async function syncGoogleDriveFolder(driveUrl: string): Promise<ActionRes
       .from("document_chunks")
       .select("metadata->sourceFile")
       .eq("folder_id", dbFolder.id);
-    
+
     const syncedFiles = new Set(existingChunks?.map(c => (c as any).sourceFile) || []);
 
     let newFilesProcessed = 0;
@@ -96,13 +127,13 @@ export async function syncGoogleDriveFolder(driveUrl: string): Promise<ActionRes
         console.log(`📄 Processing new file: ${file.name}`);
         const fileRes = await drive.files.get({ fileId: file.id, alt: "media" }, { responseType: "arraybuffer" });
         const text = await parsePdfBuffer(Buffer.from(fileRes.data as ArrayBuffer));
-        
+
         if (!text) continue;
 
         const chunks = chunkText(text, 1000);
         for (const chunk of chunks) {
           if (!chunk.trim()) continue;
-          
+
           const embedding = await getEmbedding(chunk);
           if (!embedding) continue;
 
@@ -115,18 +146,18 @@ export async function syncGoogleDriveFolder(driveUrl: string): Promise<ActionRes
           });
         }
         newFilesProcessed++;
-      } catch (e: any) { 
-        console.error(`Error processing file ${file.name}:`, e.message); 
+      } catch (e: any) {
+        console.error(`Error processing file ${file.name}:`, e.message);
       }
     }
 
-    return { 
-      success: true, 
-      data: { 
-        filesCount: files.length, 
-        folderName: "Google Drive Folder", 
-        dbFolderId: dbFolder.id 
-      } 
+    return {
+      success: true,
+      data: {
+        filesCount: files.length,
+        folderName: "Google Drive Folder",
+        dbFolderId: dbFolder.id
+      }
     };
   } catch (err: any) {
     return { success: false, error: err.message };
@@ -159,7 +190,7 @@ export async function uploadLocalFiles(formData: FormData): Promise<ActionRespon
       })
       .select("id")
       .single();
-    
+
     if (folderError || !dbFolder) return { success: false, error: "Failed to create folder record in DB." };
 
     for (const file of files) {
@@ -167,13 +198,13 @@ export async function uploadLocalFiles(formData: FormData): Promise<ActionRespon
         console.log(`📄 Processing local file: ${file.name}`);
         const arrayBuffer = await file.arrayBuffer();
         const text = await parsePdfBuffer(Buffer.from(arrayBuffer));
-        
+
         if (!text) continue;
 
         const chunks = chunkText(text, 1000);
         for (const chunk of chunks) {
           if (!chunk.trim()) continue;
-          
+
           const embedding = await getEmbedding(chunk);
           if (!embedding) continue;
 
@@ -185,18 +216,18 @@ export async function uploadLocalFiles(formData: FormData): Promise<ActionRespon
             metadata: { sourceFile: file.name },
           });
         }
-      } catch (e: any) { 
-        console.error(`Error processing file ${file.name}:`, e.message); 
+      } catch (e: any) {
+        console.error(`Error processing file ${file.name}:`, e.message);
       }
     }
 
-    return { 
-      success: true, 
-      data: { 
-        filesCount: files.length, 
-        folderName: folderName, 
-        dbFolderId: dbFolder.id 
-      } 
+    return {
+      success: true,
+      data: {
+        filesCount: files.length,
+        folderName: folderName,
+        dbFolderId: dbFolder.id
+      }
     };
   } catch (err: any) {
     return { success: false, error: err.message };
@@ -211,7 +242,7 @@ export async function generateSKSSummary(folderId: string): Promise<ActionRespon
 
     const embedding = await getEmbedding("Rangkuman intisari, konsep utama, dan definisi penting untuk persiapan ujian SKS.");
     if (!embedding) return { success: false, error: "Gagal memproses embedding materi." };
-    
+
     const { data: chunks, error: rpcError } = await supabase.rpc("match_document_chunks", {
       query_embedding: embedding,
       match_threshold: 0.3,
@@ -254,7 +285,7 @@ export async function generateBingeWatchPlan(folderId: string): Promise<ActionRe
 
     const embedding = await getEmbedding("Daftar isi, topik utama, silabus, dan ringkasan per bab.");
     if (!embedding) return { success: false, error: "Gagal memproses embedding." };
-    
+
     const { data: chunks } = await supabase.rpc("match_document_chunks", {
       query_embedding: embedding,
       match_threshold: 0.3,
@@ -286,40 +317,128 @@ Materi:\n${contextText}`;
 }
 
 export async function chatWithTutor(folderId: string | null, quarterId: string, quarterTitle: string, quarterDescription: string, userMessage: string, history: { role: "ai" | "user"; content: string }[], model: "auto" | "groq" | "gemini" = "auto"): Promise<ActionResponse<string>> {
+
   try {
     const cookieStore = await cookies();
     const supabase = createClient(cookieStore);
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return { success: false, error: "Unauthorized" };
 
-    const guardrailResult = await validateQueryWithGuardrails(userMessage, folderId);
-    if (!guardrailResult.allowed) {
+    const langfuse = getLangfuseClient();
+    const trace = langfuse ? langfuse.trace({
+      name: "learning-chat",
+      userId: user.id,
+      metadata: { folderId, quarterId, quarterTitle, model },
+    }) : null;
+
+    // 0. OpenAI Content Moderation Check (Pilar 1 - Abuse & Safety Filter with End-User ID)
+    const guardrailSpan = trace ? trace.span({ name: "guardrail-validation" }) : null;
+    const moderation = await checkOpenAIModeration(userMessage, user.id);
+    if (moderation.flagged) {
+      const moderationMessage = "Waduh, konten pertanyaanmu terindikasi melanggar panduan keamanan (konten tidak pantas/sensitif). Yuk fokus ke materi belajar ya! 🛑";
+      if (guardrailSpan) guardrailSpan.end({ output: { result: "Content Moderation Blocked", reason: moderation.reason } });
+      if (trace) {
+        trace.update({ tags: ["content-moderation-blocked"] });
+        await langfuse?.flushAsync();
+      }
+
       await supabase.from("learning_chat_history").insert([
         { user_id: user.id, folder_id: folderId, quarter_id: quarterId, role: 'user', content: userMessage },
-        { user_id: user.id, folder_id: folderId, quarter_id: quarterId, role: 'ai', content: guardrailResult.fallbackMessage }
+        { user_id: user.id, folder_id: folderId, quarter_id: quarterId, role: 'ai', content: moderationMessage }
+      ]);
+      return { success: true, data: moderationMessage };
+    }
+
+    // 1. Direct Prompt Injection Guardrail (Pilar 1)
+    if (isPromptInjection(userMessage)) {
+      const injectionMessage = "Waduh, pertanyaannya terindikasi manipulasi sistem nih! Yuk fokus belajar materi dulu ya. 📚";
+      if (guardrailSpan) guardrailSpan.end({ output: "Prompt Injection Blocked" });
+      if (trace) {
+        trace.update({ tags: ["injection-blocked"] });
+        await langfuse?.flushAsync();
+      }
+
+      await supabase.from("learning_chat_history").insert([
+        { user_id: user.id, folder_id: folderId, quarter_id: quarterId, role: 'user', content: userMessage },
+        { user_id: user.id, folder_id: folderId, quarter_id: quarterId, role: 'ai', content: injectionMessage }
+      ]);
+      return { success: true, data: injectionMessage };
+    }
+
+
+    // 2. Dynamic Intent Classifier (Pilar 1 - Dynamic Module Context)
+    const moduleInfo: ModuleContext = {
+      courseName: "Silo Learning",
+      moduleTitle: quarterTitle,
+      moduleSummary: quarterDescription
+    };
+    const intentAnalysis = await classifyQueryIntent(userMessage, moduleInfo);
+
+    // 3. Vector similarity guardrail (Pilar 2)
+    const retrievalSpan = trace ? trace.span({ name: "vector-retrieval" }) : null;
+    const guardrailResult = await validateQueryWithGuardrails(
+      intentAnalysis.cleanModuleCoreQuery || intentAnalysis.cleanEthicsCoreQuery || userMessage,
+      folderId
+    );
+    if (retrievalSpan) retrievalSpan.end({ output: { allowed: guardrailResult.allowed } });
+
+    if (!guardrailResult.allowed) {
+      if (guardrailSpan) guardrailSpan.end({ output: { result: "Vector Guardrail Blocked", intentAnalysis } });
+      if (trace) await langfuse?.flushAsync();
+
+      await supabase.from("learning_chat_history").insert([
+        { user_id: user.id, folder_id: folderId, quarter_id: quarterId, role: 'user', content: userMessage },
+        { user_id: user.id, folder_id: folderId, quarter_id: quarterId, role: 'ai', content: guardrailResult.fallbackMessage! }
       ]);
       return { success: true, data: guardrailResult.fallbackMessage! };
     }
+
+    if (guardrailSpan) guardrailSpan.end({ output: { result: "Passed", intentAnalysis } });
+
     const contextStr = guardrailResult.contextStr || "";
 
     const { data: profile } = await supabase.from('users').select('major, interests, learning_type').eq('id', user.id).single();
     const userContext = profile ? `\nContext User:\n- Jurusan: ${profile.major}\n- Minat: ${profile.interests || 'Umum'}\n- Tipe Belajar: ${profile.learning_type === 'ngebut' ? 'Ngebut/Speedrunner' : 'Santai/Chill'}` : "";
 
-    const systemInstruction = `Kamu adalah Neko, maskot kucing AI pintar dari Silo yang santuy, asik, suportif, dan sangat afirmatif. 
+    const baseSystemPrompt = buildSKSModeSystemPrompt({
+      courseName: "Silo Learning",
+      moduleTitle: quarterTitle,
+      moduleSummary: quarterDescription
+    });
+
+    const systemInstruction = `${baseSystemPrompt}
+
 Tugasmu adalah menemani dan ngebantu user belajar materi dari quarter ini: "${quarterTitle}" (${quarterDescription}).
 ${contextStr ? `\nGunakan referensi ini untuk menjawab jika relevan dengan pertanyaan:\n${contextStr}\n` : ""}
 ${userContext}
+${intentAnalysis.hasOffTopicDistraction ? `\ncatatan: Pertanyaan user terdeteksi mengandung elemen luar topik (${intentAnalysis.offTopicCategory || 'Topik Luar'}). Gunakan elemen luar tersebut HANYA sebagai ANALOGI HUMOR SINGKAT (max 1-2 kalimat) lalu SEGERA PIVOT kembali ke materi!` : ""}
+
+
+
 Aturan gaya bahasa:
 - Pake bahasa gaul lo/gue yang natural, layaknya teman belajar (atau kucing peliharaan yang cerdas), tetap mendidik dan objektif.
 - Sering kasih apresiasi, validasi, dan afirmasi positif biar user nggak gampang nyerah. Boleh selipkan gaya kucing lucu sesekali.
 - Jika pesan user adalah "Gue siap belajar materi ini", beri sapaan hangat yang asik dari Neko, kasih overview singkat banget apa yang bakal dipelajari di quarter ini.`;
 
-    const historyStr = history.slice(-4).map(h => `${h.role === 'ai' ? 'Neko' : 'User'}: ${h.content}`).join("\n");
-    const fullPrompt = historyStr 
+    const safeHistory = history
+      .slice(-4)
+      .filter(h => h.role === 'ai' || !isPromptInjection(h.content));
+
+    const historyStr = safeHistory.map(h => `${h.role === 'ai' ? 'Neko' : 'User'}: ${h.content}`).join("\n");
+    const fullPrompt = historyStr
       ? `Histori Chat Sebelumnya:\n${historyStr}\n\nUser: ${userMessage}\nNeko:`
       : `User: ${userMessage}\nNeko:`;
 
+    const generation = trace ? trace.generation({
+      name: "llm-inference",
+      model: model === "groq" ? "llama-3.1-8b-instant" : "gemini-1.5-flash",
+      input: fullPrompt,
+    }) : null;
+
     const result = await generateFastResponse(fullPrompt, systemInstruction, false, model);
+    if (generation) generation.end({ output: result });
+    if (trace) await langfuse?.flushAsync();
+
     if (!result) return { success: false, error: "Gagal memproses chat AI." };
 
     await supabase.from("learning_chat_history").insert([
@@ -332,6 +451,7 @@ Aturan gaya bahasa:
     return { success: false, error: err.message };
   }
 }
+
 
 export async function saveLearningHistory(folderId: string, title: string, type: string, content: any): Promise<ActionResponse> {
   try {
@@ -450,3 +570,29 @@ export async function syncLearningPlanToCalendar(courseTitle: string, episodes: 
     return { success: false, error: err.message };
   }
 }
+
+export async function generateChatSummary(history: { role: "ai" | "user"; content: string }[], moduleTitle?: string): Promise<ActionResponse<string>> {
+  try {
+    if (!history || history.length === 0) {
+      return { success: false, error: "Histori chat kosong." };
+    }
+
+    const conversationText = history
+      .map(h => `${h.role === 'ai' ? 'Neko' : 'User'}: ${h.content}`)
+      .join("\n");
+
+    const prompt = `Percakapan:\n${conversationText}`;
+    const summaryPrompt = buildSummaryGenerationPrompt(moduleTitle);
+    const summary = await generateDeterministicContent(prompt, summaryPrompt, false);
+
+
+    if (!summary) {
+      return { success: false, error: "Gagal membuat ringkasan materi." };
+    }
+
+    return { success: true, data: summary };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+

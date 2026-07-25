@@ -30,6 +30,7 @@
     "googleapis": "^171.4.0",
     "groq-sdk": "^1.2.1",
     "html-to-image": "^1.11.13",
+    "langfuse": "^3.38.20",
     "lucide-react": "^1.14.0",
     "next": "16.2.4",
     "next-themes": "^0.4.6",
